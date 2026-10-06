@@ -102,6 +102,12 @@ func RequireAPIKey(handler http.Handler) http.Handler {
 			JSONError(w, http.StatusUnauthorized, "Invalid API Key")
 			return
 		}
+		// Recheck account restrictions on every request, including for keys
+		// issued before the account was locked or a password reset was required.
+		if u.AccountLocked || u.PasswordChangeRequired {
+			JSONError(w, http.StatusForbidden, http.StatusText(http.StatusForbidden))
+			return
+		}
 		r = ctx.Set(r, "user", u)
 		r = ctx.Set(r, "user_id", u.Id)
 		r = ctx.Set(r, "api_key", ak)
