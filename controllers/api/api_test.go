@@ -36,6 +36,11 @@ func setupTest(t *testing.T) *testContext {
 	if err != nil {
 		t.Fatalf("error getting admin user: %v", err)
 	}
+	// API tests use an activated account, after the initial password reset.
+	u.PasswordChangeRequired = false
+	if err := models.PutUser(&u); err != nil {
+		t.Fatalf("error activating test user: %v", err)
+	}
 	ctx.apiKey = u.ApiKey
 	ctx.admin = u
 	ctx.apiServer = NewServer()

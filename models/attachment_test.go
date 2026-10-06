@@ -1,7 +1,9 @@
 package models
 
 import (
+	"archive/zip"
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"fmt"
 	"io/ioutil"
@@ -50,14 +52,33 @@ func (s *ModelsSuite) TestAttachment(c *check.C) {
 			c.Assert(a.vanillaFile, check.Equals, strings.Contains(fname, "without-vars"))
 			c.Assert(a.vanillaFile, check.Not(check.Equals), strings.Contains(fname, "with-vars"))
 
-			// Verfify template was applied as expected
+			// Verify template was applied as expected
 			tt, err := ioutil.ReadAll(t)
 			if err != nil {
 				log.Fatalf("Failed to parse templated file '%s': %v\n", fname, err)
 			}
 			templatedFile := base64.StdEncoding.EncodeToString(tt)
 			expectedOutput := readFile("testdata/" + strings.TrimSuffix(ff.Name(), filepath.Ext(ff.Name())) + ".templated" + filepath.Ext(ff.Name())) // e.g text-file-with-vars.templated.txt
-			c.Assert(templatedFile, check.Equals, expectedOutput)
+			switch filepath.Ext(fname) {
+			case ".docx", ".docm", ".pptx", ".xlsx", ".xlsm":
+				// Compression output can change between Go versions. Verify every
+				// archive entry and its exact contents instead of compressed bytes.
+				expectedBytes, err := base64.StdEncoding.DecodeString(expectedOutput)
+				c.Assert(err, check.IsNil)
+				actualZip, err := zip.NewReader(bytes.NewReader(tt), int64(len(tt)))
+				c.Assert(err, check.IsNil)
+				expectedZip, err := zip.NewReader(bytes.NewReader(expectedBytes), int64(len(expectedBytes)))
+				c.Assert(err, check.IsNil)
+				c.Assert(len(actualZip.File), check.Equals, len(expectedZip.File))
+				for i, expectedFile := range expectedZip.File {
+					actualFile := actualZip.File[i]
+					c.Assert(actualFile.Name, check.Equals, expectedFile.Name)
+					c.Assert(attachmentEntryContents(c, actualFile), check.DeepEquals,
+						attachmentEntryContents(c, expectedFile), check.Commentf("%s: %s", fname, expectedFile.Name))
+				}
+			default:
+				c.Assert(templatedFile, check.Equals, expectedOutput)
+			}
 		}
 	}
 }
@@ -79,4 +100,13 @@ func readFile(fname string) string {
 		data = base64.StdEncoding.EncodeToString(content)
 	}
 	return data
+}
+
+func attachmentEntryContents(c *check.C, file *zip.File) []byte {
+	reader, err := file.Open()
+	c.Assert(err, check.IsNil)
+	defer reader.Close()
+	contents, err := ioutil.ReadAll(reader)
+	c.Assert(err, check.IsNil)
+	return contents
 }

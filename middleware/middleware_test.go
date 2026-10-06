@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gophish/gophish/config"
@@ -35,6 +36,11 @@ func setupTest(t *testing.T) *testContext {
 		t.Fatalf("error getting user: %v", err)
 	}
 	ctx := &testContext{}
+	// API tests use an activated account, after the initial password reset.
+	u.PasswordChangeRequired = false
+	if err := models.PutUser(&u); err != nil {
+		t.Fatalf("error activating test user: %v", err)
+	}
 	ctx.apiKey = u.ApiKey
 	return ctx
 }
@@ -207,5 +213,67 @@ func TestApplySecurityHeaders(t *testing.T) {
 		if got != value {
 			t.Fatalf("incorrect security header received for %s: expected %s got %s", header, value, got)
 		}
+	}
+}
+
+// TestRequireAPIKeyAccountState checks restrictions on every request, including
+// changes made after a key was issued, for each supported credential transport.
+func TestRequireAPIKeyAccountState(t *testing.T) {
+	for _, transport := range []string{"query", "bearer", "form"} {
+		t.Run(transport, func(t *testing.T) {
+			testCtx := setupTest(t)
+			user, err := models.GetUser(1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			handler := RequireAPIKey(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				called = true
+				if ctx.Get(r, "user_id") != user.Id {
+					t.Error("authenticated user missing from context")
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			states := []struct {
+				name          string
+				locked, reset bool
+				status        int
+			}{
+				{"active", false, false, http.StatusOK},
+				{"locked", true, false, http.StatusForbidden},
+				{"reset_required", false, true, http.StatusForbidden},
+				{"both", true, true, http.StatusForbidden},
+				{"restored", false, false, http.StatusOK},
+			}
+			for _, state := range states {
+				t.Run(state.name, func(t *testing.T) {
+					user.AccountLocked, user.PasswordChangeRequired = state.locked, state.reset
+					if err := models.PutUser(&user); err != nil {
+						t.Fatal(err)
+					}
+					req := httptest.NewRequest(http.MethodGet, "/api/users/1", nil)
+					switch transport {
+					case "query":
+						q := req.URL.Query()
+						q.Set("api_key", testCtx.apiKey)
+						req.URL.RawQuery = q.Encode()
+					case "bearer":
+						req.Header.Set("Authorization", "Bearer "+testCtx.apiKey)
+					case "form":
+						req = httptest.NewRequest(http.MethodPost, "/api/reset", strings.NewReader("api_key="+testCtx.apiKey))
+						req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+					}
+					called = false
+					response := httptest.NewRecorder()
+					handler.ServeHTTP(response, req)
+					if response.Code != state.status {
+						t.Fatalf("expected %d, got %d: %s", state.status, response.Code, response.Body.String())
+					}
+					if called != (state.status == http.StatusOK) {
+						t.Fatalf("unexpected downstream handler invocation: %v", called)
+					}
+				})
+			}
+		})
 	}
 }

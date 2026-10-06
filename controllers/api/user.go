@@ -171,9 +171,11 @@ func (as *Server) User(w http.ResponseWriter, r *http.Request) {
 		}
 		existingUser.Username = ur.Username
 		// Only users with the ModifySystem permission are able to update a
-		// user's role. This prevents a privilege escalation letting users
-		// upgrade their own account.
-		if !hasSystem && ur.Role != existingUser.Role.Slug {
+		// user's role or account restrictions. Users must not be able to
+		// upgrade their own account or remove administrator-imposed restrictions.
+		if !hasSystem && (ur.Role != existingUser.Role.Slug ||
+			ur.AccountLocked != existingUser.AccountLocked ||
+			ur.PasswordChangeRequired != existingUser.PasswordChangeRequired) {
 			JSONResponse(w, models.Response{Success: false, Message: ErrInsufficientPermission.Error()}, http.StatusBadRequest)
 			return
 		}

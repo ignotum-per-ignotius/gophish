@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/bcrypt"
 
 	ctx "github.com/gophish/gophish/context"
 	"github.com/gophish/gophish/models"
+	"github.com/gorilla/mux"
 )
 
 func createUnpriviledgedUser(t *testing.T, slug string) *models.User {
@@ -255,5 +257,125 @@ func TestModifyWithExistingUsername(t *testing.T) {
 	}
 	if got.Message != expectedResponse.Message {
 		t.Fatalf("incorrect error received when setting role. expected %s got %s", expectedResponse.Message, got.Message)
+	}
+}
+
+// TestUserAccountControlPermissions exercises the handler independently of API
+// authentication so the field-level boundary cannot be masked by middleware.
+func TestUserAccountControlPermissions(t *testing.T) {
+	for _, admin := range []bool{false, true} {
+		for _, field := range []string{"account_locked", "password_change_required"} {
+			for _, initial := range []bool{false, true} {
+				t.Run(fmt.Sprintf("admin=%v/%s/initial=%v", admin, field, initial), func(t *testing.T) {
+					testCtx := setupTest(t)
+					user := createUnpriviledgedUser(t, models.RoleUser)
+					if field == "account_locked" {
+						user.AccountLocked = initial
+					} else {
+						user.PasswordChangeRequired = initial
+					}
+					if err := models.PutUser(user); err != nil {
+						t.Fatal(err)
+					}
+					actor := *user
+					if admin {
+						actor = testCtx.admin
+					}
+					// Include another valid edit to ensure denied requests save nothing.
+					payload := map[string]interface{}{"username": "changed-name", "role": user.Role.Slug, field: !initial}
+					body, err := json.Marshal(payload)
+					if err != nil {
+						t.Fatal(err)
+					}
+					req := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/api/users/%d", user.Id), bytes.NewReader(body))
+					req = mux.SetURLVars(req, map[string]string{"id": fmt.Sprint(user.Id)})
+					req = ctx.Set(req, "user", actor)
+					response := httptest.NewRecorder()
+					testCtx.apiServer.User(response, req)
+					expected := http.StatusBadRequest
+					if admin {
+						expected = http.StatusOK
+					}
+					if response.Code != expected {
+						t.Fatalf("expected %d, got %d: %s", expected, response.Code, response.Body.String())
+					}
+					got, err := models.GetUser(user.Id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					expectedLocked, expectedReset, expectedName := user.AccountLocked, user.PasswordChangeRequired, user.Username
+					if admin {
+						expectedName = "changed-name"
+						if field == "account_locked" {
+							expectedLocked = !initial
+						} else {
+							expectedReset = !initial
+						}
+					}
+					if got.AccountLocked != expectedLocked || got.PasswordChangeRequired != expectedReset || got.Username != expectedName || got.Hash != user.Hash || got.RoleID != user.RoleID {
+						t.Fatal("unexpected persisted user changes")
+					}
+					if !admin {
+						var result models.Response
+						if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+							t.Fatal(err)
+						}
+						if result.Success || result.Message != ErrInsufficientPermission.Error() {
+							t.Fatalf("unexpected denial: %+v", result)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestRestrictedUserAPIAccess proves an existing key cannot read protected data,
+// clear either restriction (including by omission), or rotate itself.
+func TestRestrictedUserAPIAccess(t *testing.T) {
+	for _, field := range []string{"account_locked", "password_change_required"} {
+		for _, transport := range []string{"bearer", "query"} {
+			t.Run(field+"/"+transport, func(t *testing.T) {
+				testCtx := setupTest(t)
+				user := createUnpriviledgedUser(t, models.RoleUser)
+				if field == "account_locked" {
+					user.AccountLocked = true
+				} else {
+					user.PasswordChangeRequired = true
+				}
+				if err := models.PutUser(user); err != nil {
+					t.Fatal(err)
+				}
+				url := fmt.Sprintf("/api/users/%d", user.Id)
+				for _, attempt := range []struct{ method, path, body string }{
+					{http.MethodGet, url, ""},
+					{http.MethodPut, url, fmt.Sprintf(`{"username":"foo","role":"user","%s":false}`, field)},
+					{http.MethodPut, url, `{"username":"foo","role":"user"}`},
+					{http.MethodPost, "/api/reset", ""},
+				} {
+					req := httptest.NewRequest(attempt.method, attempt.path, strings.NewReader(attempt.body))
+					req.Header.Set("Content-Type", "application/json")
+					if transport == "bearer" {
+						req.Header.Set("Authorization", "Bearer "+user.ApiKey)
+					} else {
+						q := req.URL.Query()
+						q.Set("api_key", user.ApiKey)
+						req.URL.RawQuery = q.Encode()
+					}
+					response := httptest.NewRecorder()
+					testCtx.apiServer.ServeHTTP(response, req)
+					if response.Code != http.StatusForbidden {
+						t.Fatalf("%s %s: expected 403, got %d", attempt.method, attempt.path, response.Code)
+					}
+					got, err := models.GetUser(user.Id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if got.AccountLocked != user.AccountLocked || got.PasswordChangeRequired != user.PasswordChangeRequired || got.ApiKey != user.ApiKey {
+						t.Fatal("restricted request changed account state")
+					}
+				}
+			})
+		}
 	}
 }
